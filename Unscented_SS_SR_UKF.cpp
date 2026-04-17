@@ -1,21 +1,22 @@
 //We're (almost) ready?
+//change: double check weighting scheme (i think its right?)
 /*
 MO-NAV-EH
 Moats Navigation-Computer Eh?
 This is a square root-spherical simplex unscented kalmann filter with augmented process noise
 this was designed around an MPU 9150, BMP 280, and GPS with altitude,and precision data.  
-Data is output to TX via Serial1 pins (POS,VEL,ACCELEROMETER BIASES,INERTIAL->BODY QUATERNION,GYRO SENSOR BIASES,MAG SENSOR PITCH BIAS,MAG SENSOR YAW BIAS,PRESSURE SENSOR BIAS)
+Data is output via Serial1 pins (POS,VEL,ACCELEROMETER BIASES,INERTIAL->BODY QUATERNION,GYRO SENSOR BIASES,MAG SENSOR PITCH BIAS,MAG SENSOR YAW BIAS,PRESSURE SENSOR BIAS)
 
 TO-DO
-Ellipsoidal Magnetometer Calibration sequence (MODERATE)
-Altimeter Updating (HIGH) (in progress...)
-EGM-2008 Onboard modeling (in progress...)
-WMM Onboard modeling (LOW)
+
+Altimeter Updating (HIGH) (in progress)
+EGM-2008 Onboard modeling (LOW (but can work for altimeter update)) (in progress...)
+WMM Onboard modeling (LOW) (would be awesome if we can update expected magnetic field for long range missions)
 ^XYZ geoMag?
 fix barometer function (HIGH) (in progress)
 
 magnetometer unexpected lockout? (MODERATE)
-Mach number compensation/lockout (HIGH) (in progress...)
+Mach number compensation/lockout (HIGH)
 
 GPS data discard (LOW) Done!? (maybe additional overrides but I trust the isValid() statement)
 Manual Mode (MODERATE)
@@ -24,6 +25,7 @@ Write/test transmission functions (HIGH) (in progress)
 Testing! (HIGH) In Progress...
 
 COMPLETE
+
 
 Double check/set correct rates for IMU (HIGH)
 magnetometer bias modeling(HIGH)
@@ -176,6 +178,37 @@ Eigen::Vector3d inertialNorth;
 Eigen::Vector3d inertialEast;
 double dt;//previous loop's time step in s
 Eigen::Vector3d initialCoords;//what it says it is (XYZ ofc)                                                                                                                                                                                                                                                                                                                       Easter Egg
+//Radio Stuff
+#define Ebyte Serial3
+enum Radio{
+  WAIT_START,READ_SEQ,READ_ID,READ_LEN,READ_DATA,READ_CHECKSUM
+};
+uint8_t lastTxSeq=0;//keeps track of last packet send attempt
+uint8_t TxPacketID=1;//what packet we're trying to send in our sendData
+uint8_t Txlength;//length of packet we're trying to send
+uint8_t TxData[64];//data to be transmitted
+Radio radio=WAIT_START;
+uint8_t rxSeq;
+uint8_t lastRxSeq=0;
+uint8_t packetID;
+uint8_t length;
+uint8_t data[64];//maximum packet size of 64 bytes
+uint8_t rxDataIndex =0;
+uint8_t checksum=0;
+bool waitingForAck=false;//if we are waiting for acknowledgment from GC
+bool waitingForRequest=true;//if we are in listening mode
+unsigned long sendTime=0;
+const unsigned long ackTimeout=500;//how long without ACK reply until we retry packet
+uint8_t retryCount=0;//how many times we've tried to send the packet
+const uint8_t maxRetrys=3;//how many times we will retry packet transmission before giving up
+//Control Stuff
+uint8_t mode=0;//0 for UKF reliant, 1 for raw sensor reliant
+uint8_t drogueOverride=1;//starts with both chute overrides enabled
+uint8_t mainOverride=1;
+uint8_t drogueDeploy=0;//True if Drogue/Main is deployed or deploying
+uint8_t mainDeploy=0;
+uint8_t drogueDesired=0;//if the computer will try to deploy drogue/main if left on auto
+uint8_t mainDesired=0;
 //I2C stuff 
 void writeByte(uint8_t addr, uint8_t reg, uint8_t val) {//I2C stuff
   Wire.beginTransmission(addr);
@@ -362,9 +395,9 @@ Eigen::Vector3d avgRot(Eigen::Matrix<double,3,Eigen::Dynamic> params,Eigen::Matr
     }
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(accum);
     //find largest eigenValue and extract the eigenvector as average quaternion
-    int maxIndex;
-    eig.eigenvalues().maxCoeff(&maxIndex);
-    Eigen::Matrix<double,4,1> qavg=eig.eigenvectors().col(maxIndex);
+    int maxrxDataIndex;
+    eig.eigenvalues().maxCoeff(&maxrxDataIndex);
+    Eigen::Matrix<double,4,1> qavg=eig.eigenvectors().col(maxrxDataIndex);
     //converting back to MRP
     Eigen::Vector3d avg=qavg.segment(1,3)/(1+qavg(0));
     if(avg.norm()>1){
@@ -663,6 +696,7 @@ Eigen::Matrix<double,3,1> PredMag(const Eigen::Ref<const Eigen::VectorXd>& state
   //Applying Magnetometer Bias (15) Yaw (16) Pitch
   //CHANGE Include axis scaling factors
   /*
+  don't use this
   double cY=cos(state(15));
   double sY=sin(state(15));
   double cP=cos(state(16));
@@ -885,6 +919,237 @@ void logData(){
     Serial.println("Write Failed");
   }
 }
+
+void ProcessPacket(uint8_t ID, uint8_t* Data, uint8_t len){
+  //handles decoding of packet sent from GC to FC
+  switch (ID){
+    case 1:{
+      //Pre-Launch Authorization
+      drogueOverride=Data[0];
+      mainOverride=Data[1];
+      mode=Data[2];
+      //CHANGE make statement to break out of pre-launch phase
+      break;
+    }
+    case 2:{
+      //Data Request
+      waitingForRequest=false;
+      drogueOverride=Data[0];
+      mainOverride=Data[1];
+      mode=Data[2];
+      if(Data[3]==1){//check to see if a fire command was sent
+        drogueDeploy=1;//fire drogue
+      }
+      if(Data[4]==1){//check to see if a fire command was sent
+        mainDeploy=1;//fire main
+      }
+      break;
+    }
+    case 3:{
+      //GC acknowledgement
+      //CHANGE, only do this if the boolean is true
+      if(Data[0]==1){
+        waitingForAck=false;//acknowledgement recieved, go back into listening mode
+      }else{
+        retryCount=0;//set back the retries because we know we are communicating. keep trying
+      } 
+      break;
+    }
+  }
+}
+void sendPacket(uint8_t seq, uint8_t id, uint8_t len, uint8_t* Data){
+  uint8_t checksum=0;
+  Ebyte.write(0xAA);//Start Tx Identifier
+  Ebyte.write(seq);//Sequence #
+  Ebyte.write(id);//Packet Identifier
+  Ebyte.write(len);//packet length in bytes
+  checksum^=seq;
+  checksum^=id;
+  checksum^=len;
+  for(int i=0; i<len; i++){
+    Ebyte.write(Data[i]);
+    checksum^=Data[i];
+  }
+  Ebyte.write(checksum);//ground station checks to compare this to it's own checksum
+}
+void getTXData(uint8_t ID){
+  //prepares TxData array for transmission
+  switch (ID){
+    case 1:{
+      //Positioning Packet
+      Txlength=36;
+      Eigen::Matrix<double,3,1> tempCoords=x_mean.segment(0,3)+initialCoords;
+      Eigen::Matrix<float,3,1> tempVel=x_mean.segment(3,3).cast<float>();
+      for(int i=0; i<3; i++){
+        memcpy(&TxData[i*8],&tempCoords(i),8);
+        memcpy(&TxData[i*4+24],&tempVel(i),4);
+      }
+      break;
+    }
+    case 2:{
+      //Orientation Packet
+      Txlength=36;
+      Eigen::Matrix<float,3,1> tempMRP=x_mean.segment(9,3).cast<float>();
+      Eigen::Matrix<float,3,1> tempAngRate=rates.segment(3,3).cast<float>();
+      Eigen::Matrix<float,3,1> tempMag=mag.cast<float>();
+      for(int i=0; i<3; i++){
+        memcpy(&TxData[i*4],&tempMRP(i),4);
+        memcpy(&TxData[i*4+12],&tempAngRate(i),4);
+        memcpy(&TxData[i*4+24],&tempMag(i),4);
+      }
+      break;
+    }
+    case 3:{
+      //Sensor Packet
+      Txlength=36;
+      Eigen::Matrix<float,3,1>tempAccel=rates.segment(0,3).cast<float>();
+      Eigen::Matrix<float,3,1>tempAccelBias=x_mean.segment(6,3).cast<float>();
+      Eigen::Matrix<float,3,1>tempGyroBias=x_mean.segment(12,3).cast<float>();
+      for(int i=0; i<3; i++){
+        memcpy(&TxData[i*4],&tempAccel(i),4);
+        memcpy(&TxData[i*4+12],&tempAccelBias(i),4);
+        memcpy(&TxData[i*4+24],&tempGyroBias(i),4);
+      }
+      break;
+    }
+    case 4:{
+      //Weather Packet
+
+      break;
+    }
+    case 5:{
+      //State Uncertainty
+      Txlength=28;
+      Eigen::Matrix<float,6,1>tempUncert=Sx.diagonal().segment(0,6).cast<float>();
+      for(int i=0; i<6; i++){
+        memcpy(&TxData[i*4],&tempUncert(i),4);
+      }
+      Eigen::Vector3f tempUncertMRP=Sx.diagonal().segment(9,3).cast<float>();
+      float angUncert=(4*atan(tempUncertMRP.norm()));
+      memcpy(&TxData[24],&angUncert,4);
+      break;
+    }
+    case 6:{
+      //Controls
+      Txlength=10;
+      float tempTime=static_cast<float>(Time);
+      memcpy(&TxData[0],&tempTime,4);
+      TxData[4]=drogueDeploy;
+      TxData[5]=mainDeploy;
+      TxData[6]=drogueDesired;
+      TxData[7]=mainDesired;
+      TxData[8]=drogueOverride;
+      TxData[9]=mainOverride;
+      break;
+    }
+  }
+}
+void sendData(uint8_t ID, uint8_t len, uint8_t* Data){//start
+  if(waitingForAck) return;//don't send if we're waiting on reply
+  lastTxSeq++;//set new sequence number for this Tx
+  //send packet
+  sendPacket(lastTxSeq,ID,len, Data);
+  waitingForAck=true;
+  sendTime=millis();
+  retryCount=0;
+}
+void sendAck(uint8_t seq, uint8_t check){//Sends packet aknowledgment transmission back
+  //check is uint8_t boolean for if we are acknowledging a succesfull transmission
+  sendPacket(seq, 7, 1, &check);//Sends packet ID 7 (Aknowledgment) with boolean for checksum match
+}
+void recieve(){
+  while(Ebyte.available()){
+    uint8_t byteIn=Ebyte.read();
+    switch (radio){
+      case WAIT_START:{
+        if(byteIn==0xAA){
+          radio=READ_SEQ;
+          checksum=0;
+        }
+        break;
+      }
+      case READ_SEQ:{
+        rxSeq=byteIn;
+        checksum^=byteIn;
+        radio=READ_ID;
+        break;
+      }
+      case READ_ID:{
+        packetID=byteIn;
+        checksum^=byteIn;
+        radio=READ_LEN;
+        break;
+      }
+      case READ_LEN:{
+        length=byteIn;
+        if(length>64){
+          //reset us out of the read
+          radio=WAIT_START;
+          return;
+        }
+        checksum^=byteIn;
+        rxDataIndex=0;
+        radio=READ_DATA;
+        break;
+      }
+      case READ_DATA:{
+        data[rxDataIndex++]=byteIn;
+        checksum^=byteIn;
+        if(rxDataIndex>=length){
+          radio=READ_CHECKSUM;
+        }
+        break;
+      }
+      case READ_CHECKSUM:{
+        if(checksum==byteIn){
+          //send acknowledgement
+          sendAck(rxSeq,1);
+          if(rxSeq==lastRxSeq){
+            //duplicate sequence
+            radio=WAIT_START;
+            return;
+          }
+          lastRxSeq=rxSeq;
+          //CHANGE process packet here
+        }else{
+          //send acknowledgement, but ask for another send
+          sendAck(rxSeq,0);
+        }
+        radio=WAIT_START;
+        break;
+      }
+    }
+  }
+}
+void radioShack(){//Handles Data recieving/transmitting
+//checks if we are
+  
+  //Checks If we're waiting for an acknowledgement
+  if(!waitingForAck){
+    if(!waitingForRequest){
+      //send data if we're not listening for the request signal
+      getTXData(TxPacketID);
+      sendData(TxPacketID,Txlength,TxData);
+      TxPacketID++;
+      if(TxPacketID>=6){
+        //resets packet ID and puts listening mode back on
+        TxPacketID=1;
+        waitingForRequest=true;
+      }
+    }
+  }else{
+    if(millis()-sendTime>ackTimeout){
+      if(retryCount<maxRetrys){
+        retryCount++;//retry packet send on timeout
+        sendPacket(lastTxSeq,TxPacketID,Txlength,TxData);
+        sendTime=millis();
+      }else{
+        waitingForAck=false;//give up TX after maxRetrys
+      }
+    }
+  }
+}
+
 //CHANGE, need packet scheme, this will be the slave device to Grond Control and send confirmation of recieved commands, will confirm each packet is sent by sending packet and listening for packet identifier+acknowledgement code
 
 /*
@@ -914,7 +1179,7 @@ Launch Packet 4: Accel Rates, Gyro Rates, Humidity (float)
 
 
 
-/*
+/*coming soon
 double getUndulation(Eigen::Vector3d POS){
   //returns Geoid undulation in m for given pos in geodectic coords
   //convert geodectic coords to lat/lon
@@ -1091,7 +1356,7 @@ void setup() {
 }
 float magtimer=0;
 void loop() {
-  // put your main code here, to run repeatedly:
+
   if(DEBUG){
     Serial.println("Loop Started");
   }
@@ -1140,11 +1405,10 @@ void loop() {
   }
   //Run measurement updates
   GPSUpdate();
-  if(magtimer>0.03){
+  if(magtimer>0.03){//artificially slowed down. might change later
     MagUpdate();
     magtimer=0;
   }
-  //transmission stuff
 
 
   if(DEBUG){
