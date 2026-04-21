@@ -14,13 +14,12 @@ EGM-2008 Onboard modeling (LOW (but can work for altimeter update)) (in progress
 WMM Onboard modeling (LOW) (would be awesome if we can update expected magnetic field for long range missions)
 ^XYZ geoMag?
 fix barometer function (HIGH) (in progress)
-
 magnetometer unexpected lockout? (MODERATE)
 Mach number compensation/lockout (HIGH)
 
 GPS data discard (LOW) Done!? (maybe additional overrides but I trust the isValid() statement)
-Manual Mode (MODERATE)
-Write/test transmission functions (HIGH) (in progress)
+Manual Mode (HIGH) (in progress)
+test transmission functions (HIGH) (in progress)
 
 Testing! (HIGH) In Progress...
 
@@ -28,10 +27,11 @@ COMPLETE
 
 
 Double check/set correct rates for IMU (HIGH)
-magnetometer bias modeling(HIGH)
+magnetometer calibration(HIGH)
 re-verify magnetometer function (HIGH) 
 GPS data discard (LOW)
 SD Logging (HIGH) 
+Write Transmission functions (HIGH)
 
 TESTS TO-DO
 GPS verification (live) Done! (Needs large scale testing)
@@ -108,108 +108,110 @@ tachometer observer
   ⠊⠰⢀⠁⠂⠄⠡⠐⠁⠂⢀⠐⠀⠂⡁⢀⠂⠠⠀⡁⠠⠁⠄⢂⠡⡘⢆⢧⣋⠾⣜⣭⠳⣼⣿⣿⣿⣿⣿⡿⢳⣸⣿⣿⣿⣿⢀⠂⢌⡘⠴⣉⠖⣩⠒⡬⢓⡌⡳⡁⢆⡹⢎⠧⢁⠂⠄⠈⠠⠐⡌⡳⢎⠶⣉⠖⠡⡐⢁⠂⠄
 */
 //Math stuff
-#include <ArduinoEigen.h>
-#include <cmath>
-#define StateNum 15
-#define ProcNum 6
-#define L StateNum+ProcNum
-#define N L+2
-const double W0=0.2;//Tune this, weight of mean (noiseless) sigma point
-const double W1=(1-W0)/(L+1);//weights of all the other ones
+  #include <ArduinoEigen.h>
+  #include <cmath>
+  #define StateNum 15
+  #define ProcNum 6
+  #define L StateNum+ProcNum
+  #define N L+2
+  const double W0=0.2;//Tune this, weight of mean (noiseless) sigma point
+  const double W1=(1-W0)/(L+1);//weights of all the other ones
 //Sensor stuff
-const double gyroScale=((M_PI/180)/65.5);//conversion from Raw Data to Rad/s
-const double accelScale=9.81/2048.0f;//Conversion from Raw Data to m/s/s
-#define MPU_ADDR 0x68
-#define MAG_ADDR 0x0C
-#include <Wire.h>
-#include <I2Cdev.h>
-#include <TinyGPS++.h>
-#include <SD.h>
-#include <SPI.h>
-const int chipSelect = BUILTIN_SDCARD;//For Teensy 4.1 onboard SD
-Eigen::Vector3d mag;//magnetometer reading
-Eigen::Matrix<double,6,1> rates;//raw body rates from IMU
-Eigen::Quaterniond inerToBody;//Mean/Predicted Orientation Quaternion
-Eigen::Quaterniond nextInerToBody;//Predicted k+1 Quaternion using mean gyr bias
-TinyGPSPlus gps;//take a guess
+  const double gyroScale=((M_PI/180)/65.5);//conversion from Raw Data to Rad/s
+  const double accelScale=9.81/2048.0f;//Conversion from Raw Data to m/s/s
+  Eigen::Vector3d magBias=Eigen::Vector3d::Zero();
+  Eigen::Vector3d magScale (1,1,1);
+  #define MPU_ADDR 0x68
+  #define MAG_ADDR 0x0C
+  #include <Wire.h>
+  #include <I2Cdev.h>
+  #include <TinyGPS++.h>
+  #include <SD.h>
+  #include <SPI.h>
+  const int chipSelect = BUILTIN_SDCARD;//For Teensy 4.1 onboard SD
+  Eigen::Vector3d mag;//magnetometer reading
+  Eigen::Matrix<double,6,1> rates;//raw body rates from IMU
+  Eigen::Quaterniond inerToBody;//Mean/Predicted Orientation Quaternion
+  Eigen::Quaterniond nextInerToBody;//Predicted k+1 Quaternion using mean gyr bias
+  TinyGPSPlus gps;//take a guess
 //Time stuff
-unsigned long lastMillis;//time in ms at the end of the last timestep
-double Time=0;//timer variable for how long the system has been on
-double timer;//timer varible for measurement update frequency
-double logTimer;//timer variable for datalogging
-double calibtimer;//CHANGE temporary timer for calibration
+  unsigned long lastMillis;//time in ms at the end of the last timestep
+  double Time=0;//timer variable for how long the system has been on
+  double timer;//timer varible for measurement update frequency
+  double logTimer;//timer variable for datalogging
+  double calibtimer;//CHANGE temporary timer for calibration
 //Debugging Stuff
-#define DEBUG true
-#define printPropogations false //prints every sigma point propogation
-#define printPropogationProb true //prints covariance update math
-#define printMeas true//prints the sigma points and matricies used in the measure function
+  #define DEBUG true
+  #define printPropogations false //prints every sigma point propogation
+  #define printPropogationProb true //prints covariance update math
+  #define printMeas true//prints the sigma points and matricies used in the measure function
 //weather stuff
-#define lapseRate 1
-#define Rdry 287.05287//J/kg/K
-#define Rvap 461.51
-#define LaunchHeight 50
-#define SemiMajor 6378137
-#define SemiMajorSq 6378137.0*6378137.0
-#define SemiMinorSq 6356752.314245*6356752.314245
-#define ecc 1/298.257223563
-double Undulation;
-double groundTemp;//Ground temperature in deg K
-double groundPres;//Ground Pressure in Pa
-double groundAlt;//Launch altitude  in m
-double QNH;
+  #define lapseRate 1
+  #define Rdry 287.05287//J/kg/K
+  #define Rvap 461.51
+  #define LaunchHeight 50
+  #define SemiMajor 6378137
+  #define SemiMajorSq 6378137.0*6378137.0
+  #define SemiMinorSq 6356752.314245*6356752.314245
+  #define ecc 1/298.257223563
+  double Undulation;
+  double groundTemp;//Ground temperature in deg K
+  double groundPres;//Ground Pressure in Pa
+  double groundAlt;//Launch altitude  in m
+  double QNH;
 //UKF stuff
-Eigen::Matrix<double,StateNum,StateNum> Sx;
-Eigen::Matrix<double, StateNum,1> y_mean;
-Eigen::MatrixXd Y;
-Eigen::Matrix<double,StateNum,1> State;//xPos,yPos,zPos, xVel,yVel,zVel, xAccelBias,yAccelBias,zAccelBias, xAngErr,yAngErr,zAngErr, xGyroBias,yGyroBias,zGyroBias, Pitch Mag Bias(Rad),Yaw Mag Bias(Rad),Pressure Sensor Bias
+  Eigen::Matrix<double,StateNum,StateNum> Sx;
+  Eigen::Matrix<double, StateNum,1> y_mean;
+  Eigen::MatrixXd Y;
+  Eigen::Matrix<double,StateNum,1> State;//xPos,yPos,zPos, xVel,yVel,zVel, xAccelBias,yAccelBias,zAccelBias, xAngErr,yAngErr,zAngErr, xGyroBias,yGyroBias,zGyroBias, Pitch Mag Bias(Rad),Yaw Mag Bias(Rad),Pressure Sensor Bias
 //Proccess variables accelerometer Noise, gyro Noise (NEXT TO BE ADDED) Accel Bias Noise, Gyro Bias Noise, Noise in Mag Bias Pitch, Noise in Mag Bias Yaw
-Eigen::Matrix<double,L,N> SigPoints;
-Eigen::Matrix<double,N,1> w;
-Eigen::Matrix<double,3,1> magDir;//true magnetic vector in inertial frame
-Eigen::Matrix<double,N,1> W;
-Eigen::Matrix<double,ProcNum,ProcNum> Sw;
-Eigen::Matrix<double,3,3> RGps;
-Eigen::Matrix<double,3,3> RMag;
-Eigen::Matrix<double,6,6> RStill;
-Eigen::Matrix<double,StateNum,1> x_mean;
-double Grav=9.80665;//Standard gravitational accecleration m/s/s
-Eigen::Vector3d inertialDown;//down (gasp)
-Eigen::Vector3d inertialNorth;
-Eigen::Vector3d inertialEast;
-double dt;//previous loop's time step in s
-Eigen::Vector3d initialCoords;//what it says it is (XYZ ofc)                                                                                                                                                                                                                                                                                                                       Easter Egg
+  Eigen::Matrix<double,L,N> SigPoints;
+  Eigen::Matrix<double,N,1> w;
+  Eigen::Matrix<double,3,1> magDir;//true magnetic vector in inertial frame
+  Eigen::Matrix<double,N,1> W;
+  Eigen::Matrix<double,ProcNum,ProcNum> Sw;
+  Eigen::Matrix<double,3,3> RGps;
+  Eigen::Matrix<double,3,3> RMag;
+  Eigen::Matrix<double,6,6> RStill;
+  Eigen::Matrix<double,StateNum,1> x_mean;
+  double Grav=9.80665;//Standard gravitational accecleration m/s/s
+  Eigen::Vector3d inertialDown;//down (gasp)
+  Eigen::Vector3d inertialNorth;
+  Eigen::Vector3d inertialEast;
+  double dt;//previous loop's time step in s
+  Eigen::Vector3d initialCoords;//what it says it is (XYZ ofc)                                                                                                                                                                                                                                                                                                                       Easter Egg
 //Radio Stuff
-#define Ebyte Serial3
-enum Radio{
-  WAIT_START,READ_SEQ,READ_ID,READ_LEN,READ_DATA,READ_CHECKSUM
-};
-uint8_t lastTxSeq=0;//keeps track of last packet send attempt
-uint8_t TxPacketID=1;//what packet we're trying to send in our sendData
-uint8_t Txlength;//length of packet we're trying to send
-uint8_t TxData[64];//data to be transmitted
-Radio radio=WAIT_START;
-uint8_t rxSeq;
-uint8_t lastRxSeq=0;
-uint8_t packetID;
-uint8_t length;
-uint8_t data[64];//maximum packet size of 64 bytes
-uint8_t rxDataIndex =0;
-uint8_t checksum=0;
-bool waitingForAck=false;//if we are waiting for acknowledgment from GC
-bool waitingForRequest=true;//if we are in listening mode
-unsigned long sendTime=0;
-const unsigned long ackTimeout=500;//how long without ACK reply until we retry packet
-uint8_t retryCount=0;//how many times we've tried to send the packet
-const uint8_t maxRetrys=3;//how many times we will retry packet transmission before giving up
+  #define Ebyte Serial3
+  enum Radio{
+    WAIT_START,READ_SEQ,READ_ID,READ_LEN,READ_DATA,READ_CHECKSUM
+  };
+  uint8_t lastTxSeq=0;//keeps track of last packet send attempt
+  uint8_t TxPacketID=1;//what packet we're trying to send in our sendData
+  uint8_t Txlength;//length of packet we're trying to send
+  uint8_t TxData[64];//data to be transmitted
+  Radio radio=WAIT_START;
+  uint8_t rxSeq;
+  uint8_t lastRxSeq=0;
+  uint8_t packetID;
+  uint8_t length;
+  uint8_t data[64];//maximum packet size of 64 bytes
+  uint8_t rxDataIndex =0;
+  uint8_t checksum=0;
+  bool waitingForAck=false;//if we are waiting for acknowledgment from GC
+  bool waitingForRequest=true;//if we are in listening mode
+  unsigned long sendTime=0;
+  const unsigned long ackTimeout=500;//how long without ACK reply until we retry packet
+  uint8_t retryCount=0;//how many times we've tried to send the packet
+  const uint8_t maxRetrys=3;//how many times we will retry packet transmission before giving up
 //Control Stuff
-uint8_t mode=0;//0 for UKF reliant, 1 for raw sensor reliant
-uint8_t drogueOverride=1;//starts with both chute overrides enabled
-uint8_t mainOverride=1;
-uint8_t drogueDeploy=0;//True if Drogue/Main is deployed or deploying
-uint8_t mainDeploy=0;
-uint8_t drogueDesired=0;//if the computer will try to deploy drogue/main if left on auto
-uint8_t mainDesired=0;
-//I2C stuff 
+  uint8_t mode=0;//0 for UKF reliant, 1 for raw sensor reliant
+  uint8_t drogueOverride=1;//starts with both chute overrides enabled
+  uint8_t mainOverride=1;
+  uint8_t drogueDeploy=0;//True if Drogue/Main is deployed or deploying
+  uint8_t mainDeploy=0;
+  uint8_t drogueDesired=0;//if the computer will try to deploy drogue/main if left on auto
+  uint8_t mainDesired=0;
+//Sensor functions 
 void writeByte(uint8_t addr, uint8_t reg, uint8_t val) {//I2C stuff
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -220,7 +222,7 @@ uint8_t readByte(uint8_t addr, uint8_t reg) {//More I2C stuff
   Wire.beginTransmission(addr);
   Wire.write(reg);
   Wire.endTransmission(false);
-  Wire.requestFrom((int)addr, (uint8_t)1);
+  Wire.requestFrom((int)addr, (int)1);
   if (Wire.available()) return Wire.read();
   return 0XdF;
 }
@@ -274,6 +276,8 @@ bool getMag(Eigen::Ref<Eigen::Matrix<double,3,1>> Mag){
   Mag(1) = mx;
   Mag(0) = my;
   Mag(2) = -mz;
+  Mag*=0.3
+  Mag=(Mag-magBias).cwiseProduct(magScale);//CHANGE Double check this
 
   if(DEBUG){
     Serial.println("Magnetometer Got!");
@@ -330,6 +334,27 @@ void init9150() {//resets and turns on MPU, sets rates, and enables magnetometer
   }
 
 }
+void check9150(){
+  //checks and resets MPU
+    if (readByte(0x68,0x75)==0x68){
+    if(readByte(0x68,0x37)==2){
+      uint8_t val=(readByte(0x68,0x6B)>>6) & 1;
+      if(val==0){
+        if(readByte(0x68,0x6A)==0){
+          return;
+        }
+      }
+    }
+  }
+  if(DEBUG){
+    Serial.println("MPU ERROR DETECTED");
+  }
+  Wire.end();
+  Wire.begin();
+  delay(50);
+  init9150();
+}
+//UKF Functions
 template<typename DerivedS, typename DerivedV>//No idea but it wsa crashing without this
 void cholUpdate(Eigen::MatrixBase<DerivedS>& S,  const Eigen::MatrixBase<DerivedV>& x_in, double w){//Chat Wrote this ngl
   if(DEBUG){
@@ -378,33 +403,33 @@ Eigen::Vector3d avgRot(Eigen::Matrix<double,3,Eigen::Dynamic> params,Eigen::Matr
     //finds average rotation from a set of modified rodriguez parameters (MRP's)
     //params are 3xn MRP corresponding to nx1 weights vector
     //finds average rotation using Eigendecomposition sum of outer products method
-    Eigen::Matrix<double,4,4> accum=Eigen::Matrix<double,4,4>::Zero();
-    for(int i=0; i<params.cols(); i++){
-      double sqNorm=params.col(i).squaredNorm();
-      if(sqNorm>1){
-        params.col(i)-=params.col(i)/sqNorm;
-      }
-      Eigen::Matrix<double,4,1> Quat;
-      //turning MRP into Quaternion
-      Quat(0)=(1-sqNorm)/(1+sqNorm);
-      Quat.segment(1,3)=2*params.col(i)/(1+sqNorm);
-      if(Quat(0)<0){
-        Quat=-Quat;
-      }
-      accum+=Quat*Quat.transpose()*weights(i);
+  Eigen::Matrix<double,4,4> accum=Eigen::Matrix<double,4,4>::Zero();
+  for(int i=0; i<params.cols(); i++){
+    double sqNorm=params.col(i).squaredNorm();
+    if(sqNorm>1){
+      params.col(i)-=params.col(i)/sqNorm;
     }
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(accum);
-    //find largest eigenValue and extract the eigenvector as average quaternion
-    int maxrxDataIndex;
-    eig.eigenvalues().maxCoeff(&maxrxDataIndex);
-    Eigen::Matrix<double,4,1> qavg=eig.eigenvectors().col(maxrxDataIndex);
-    //converting back to MRP
-    Eigen::Vector3d avg=qavg.segment(1,3)/(1+qavg(0));
-    if(avg.norm()>1){
-      avg=-avg/avg.squaredNorm();
+    Eigen::Matrix<double,4,1> Quat;
+    //turning MRP into Quaternion
+    Quat(0)=(1-sqNorm)/(1+sqNorm);
+    Quat.segment(1,3)=2*params.col(i)/(1+sqNorm);
+    if(Quat(0)<0){
+      Quat=-Quat;
     }
-    return avg;
+    accum+=Quat*Quat.transpose()*weights(i);
   }
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eig(accum);
+  //find largest eigenValue and extract the eigenvector as average quaternion
+  int maxrxDataIndex;
+  eig.eigenvalues().maxCoeff(&maxrxDataIndex);
+  Eigen::Matrix<double,4,1> qavg=eig.eigenvectors().col(maxrxDataIndex);
+  //converting back to MRP
+  Eigen::Vector3d avg=qavg.segment(1,3)/(1+qavg(0));
+  if(avg.norm()>1){
+    avg=-avg/avg.squaredNorm();
+  }
+  return avg;
+}
 Eigen::Matrix<double,StateNum,1> Propogate(Eigen::Ref<Eigen::VectorXd> state,Eigen::Ref<Eigen::VectorXd> proc){
   Eigen::Vector3d modRodParam=(state.segment(9,3));//inertial frame orientation offset (from expected orientation)
   if(modRodParam.norm()>1){
@@ -652,6 +677,7 @@ Eigen::Matrix<double,6,1> getINS(){//Returns 6 element Eigen vector [x,y,z]m/s/s
   if(DEBUG){
     Serial.println("Getting INS...");
   }
+  check9150();
   uint8_t buffer[14];
   I2Cdev::readBytes(MPU_ADDR,0x3B,14,buffer);
   Eigen::Matrix<double,6,1> IMU;
@@ -717,7 +743,7 @@ Eigen::Matrix<double,1,1> PredTachometer(const Eigen::Ref<const Eigen::VectorXd>
   return PredMeas;
 }
 Eigen::Matrix<double,3,1> PredDown(const Eigen::Ref<const Eigen::VectorXd>& state){
-  //CHANGE FUNCTION IS OUT OF DATE
+  //CHANGE FUNCTION IS OUT OF DATE. DO NOT USE
   Eigen::Matrix<double,3,1> PredMeas;
   PredMeas=-state.segment(0,3);
   Eigen::Quaterniond angErr;
@@ -811,6 +837,7 @@ void MagUpdate(){
   x_mean.segment(9,3)=Eigen::Vector3d::Zero();
   GenSigPoints();
 }
+//Initialization Functions
 void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organization using triad with magnetometer and gravity direction
   if(DEBUG){
     Serial.println("Getting Orientation...");
@@ -866,6 +893,89 @@ void getOrientation(Eigen::Vector3d a, Eigen::Vector3d m){//gets initial organiz
     Serial.println("Orientation Got!");
   }
 }
+void calibrateMag(){
+  bool Calibration=true;
+  Eigen::Vector3d m;
+  Eigen::Matrix<double,3,Eigen::Dynamic> tempEllipsoid;
+  for(int i=0; i<3; i++){
+    if(DEBUG){
+      Serial.print("Please hold axis ");
+      Serial.print(i);
+      Serial.println(" vertical");
+    }
+    Eigen::Vector3d downAxis=Eigen::Vector3d::Zero();
+    downAxis(i)=1;//
+      while(abs(rates.segment(0,3).normalized().dot(downAxis))<0.975){
+        //repeats until accelerometer measures straight down (within 15 ish degrees)
+        rates=getINS();
+        delay(100);
+      }
+      if(DEBUG){
+        Serial.println("Please rotate around axis slowly");
+      }
+      getMag(m);
+      double lastAng=0;
+      double rotationAngle=0;
+      Eigen::Matrix<double,3,Eigen::Dynamic> tempMag;
+      int n=0;
+      lastMillis=millis();
+      while (abs(rotationAngle)<2.125*M_PI){
+        //requires 382.5 degrees of rotation about the selected axis
+        rates=getINS();
+        dt=double((millis()-lastMillis)/1000.0f);
+        Serial.println(millis());
+        Serial.println(lastMillis);
+        lastMillis=millis();
+        if(abs(rates.segment(0,3).normalized().dot(downAxis))>0.8){
+          rotationAngle+=rates(3+i)*dt;
+          if(DEBUG){
+            Serial.println(dt*1000);
+            Serial.println("rotationAngle");
+            Serial.println(rotationAngle*180/M_PI);
+          }
+          if(abs(lastAng-rotationAngle)>0.09){
+            getMag(m);
+            tempMag.conservativeResize(3,n+1);
+            tempMag.col(n)=m;
+            n++;
+            lastAng=rotationAngle;
+            if(DEBUG) Serial.println("Point Saved!");
+          }
+          Serial.println("keep going...");
+          delay(50);
+        }else{
+          if(DEBUG) Serial.println("HOLD AXIS DOWN");
+        }
+        delay(50);
+      }
+        tempEllipsoid.conservativeResize(3,tempEllipsoid.cols()+tempMag.cols());
+        tempEllipsoid.rightCols(tempMag.cols())=tempMag;
+  }
+  //Ellipsoid Fitting!
+  if(DEBUG){
+    Serial.println("Fitting Ellipsoid...");
+  }
+  Eigen::Matrix<double,Eigen::Dynamic,7> Mat(tempEllipsoid.cols(),7);
+  for(int i=0; i<tempEllipsoid.cols(); i++){
+    Eigen::Vector3d temp=tempEllipsoid.col(i);
+    for(int j=0; j<3; j++){
+      Mat(i,j)=temp(j)*temp(j);
+      Mat(i,j+3)=temp(j);
+    }
+    Mat(i,6)=1;
+  }
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(Mat,Eigen::ComputeFullV);
+  Eigen::VectorXd p=svd.matrixV().col(6);
+  for (int i=0; i<3; i++){
+    magBias(i)=-p(i+3)/(2*p(i));
+  }
+  double k=p(6)+(magBias.cwiseAbs2()).transpose()*p.segment(0,3);
+  for (int i=0; i<3; i++){
+    magScale(i)=sqrt(-k/p(i));
+    magScale/=magDir.norm();
+  }
+}
+//SD logging functions
 Eigen::Matrix<double,25,1> FlightData(){
   Eigen::Matrix<double,25,1> Dat;
   Dat.segment(0,6)=x_mean.segment(0,6);//Pos&Vel (relative to initial Position)
@@ -919,7 +1029,7 @@ void logData(){
     Serial.println("Write Failed");
   }
 }
-
+//Transmission Functions
 void ProcessPacket(uint8_t ID, uint8_t* Data, uint8_t len){
   //handles decoding of packet sent from GC to FC
   switch (ID){
@@ -1121,11 +1231,10 @@ void recieve(){
     }
   }
 }
-void radioShack(){//Handles Data recieving/transmitting
-//checks if we are
-  
+void transmit(){//Handles Data recieving/transmitting
   //Checks If we're waiting for an acknowledgement
   if(!waitingForAck){
+    //if we're not, see if we're waiting for a data request (listening mode)
     if(!waitingForRequest){
       //send data if we're not listening for the request signal
       getTXData(TxPacketID);
@@ -1138,6 +1247,7 @@ void radioShack(){//Handles Data recieving/transmitting
       }
     }
   }else{
+    //if we are, check if we've timed out watiting
     if(millis()-sendTime>ackTimeout){
       if(retryCount<maxRetrys){
         retryCount++;//retry packet send on timeout
@@ -1149,36 +1259,11 @@ void radioShack(){//Handles Data recieving/transmitting
     }
   }
 }
-
-//CHANGE, need packet scheme, this will be the slave device to Grond Control and send confirmation of recieved commands, will confirm each packet is sent by sending packet and listening for packet identifier+acknowledgement code
-
-/*
-current ideas
-package name is first byte
-pre-launch package (initial Pos, initial heading (MRP's), system time at startup)
-^IP is doubles, heading is floats, time is float
-8*3+4*3+4=40 bytes
-
-//All launch packet data will be stored at the same time, but packets sent individually
-
-Launch Packet 1: Pos, Vel, orientation MRP's, time
-all floats 4*3+4*3+4*3+4=40 bytes
-
-Launch Packet 2: Pressure,dP/dt (1s avg), Temperature, Error in Pos, Error in Vel, Single angle error in heading
-4+4+3*4+3*4+4=36 bytes
-
-Launch Packet 3: Accelerometer Biases, Gyro Biases, Current Mode (0 UKF/1 Manual), Stage 1 LOCKOUT (0 OFF/1 ON), Stage 2 LOCKOUT (0 OFF, 1 ON)
-Have I blown Charge 1? (0 NO/ 1 YES), Have I blown Charge 2? (0 NO/ 1 YES), Am I ready to blow Charge 1?, Am I ready to blow Charge 2
-//CHANGE, better way to send the status
-4*3+4*3+1+1+1 +1+1+1+1
-31 bytes
-
-Launch Packet 4: Accel Rates, Gyro Rates, Humidity (float)
-3*4+3*4+4=16 bytes
-*/
-
-
-
+//Control Functions
+void ControlRocket(){
+  //handles and checks for chute staging 
+}
+//Weather Functions
 /*coming soon
 double getUndulation(Eigen::Vector3d POS){
   //returns Geoid undulation in m for given pos in geodectic coords
@@ -1233,7 +1318,7 @@ double getUndulation(Eigen::Vector3d POS){
 }
 */
 void setup() {
-  magDir<<49617,19075.4,-1332.7;//CHANGE XYZ geomag library
+  magDir<<49.617,19.0754,-1.3327;//CHANGE XYZ geomag library
   //CHANGE magNorm checks
   magDir.normalize();
   Serial.begin(115200);
@@ -1283,7 +1368,14 @@ void setup() {
   Eigen::Vector3d magSum=Eigen::Vector3d::Zero();
   Eigen::Vector3d magSquareSum=Eigen::Vector3d::Zero();
   Serial.println("Beginning Calibration");
-
+  calibrateMag();
+  if(DEBUG){
+    Serial.println("Magnetometer Calibrated");
+    printMatrix(magBias);
+    printMatrix(magScale);
+    Serial.println("Now hold still for orientation");
+  }
+  delay(500);
   while ((deltaAccDev>0.1&&deltaMagDev>0.1)||n<50){//repeats loop until both vectors have a cahnge in variance of <=0.1 rad after at least 50 samples
     delay(100);
     a=getINS().segment(0,3);
@@ -1417,20 +1509,3 @@ void loop() {
   
   delay(10);//adding a small delay so we never go >100hz (MPU9150 max rate) (CHANGE later maybe)
 }
-
-/*  
-  Old calibration code that might still work. Hold system still, rotate it around a bit while these checks are occuring. Uses accelerometer reading for downwards direction
-    Eigen::Matrix<double,6,1> stillMeas;
-    stillMeas<<initialPos,Eigen::Vector3d::Constant(0);
-    Meas<6>(stillMeas,RStill,PredStill);
-    GenSigPoints();
-    calibtimer+=dt;
-    //
-    Eigen::Vector3d Down=-rates.segment(0,3);
-    Meas<3>(Down.normalized(),RMag,PredDown);
-    smallAngleUpdate.w()=1;
-    smallAngleUpdate.vec()=State.segment(9,3)*0.5;
-    inerToBody=inerToBody*smallAngleUpdate;
-    State.segment(9,3)=Eigen::Vector3d::Constant(0);//resets expected angular error to 0
-    inerToBody.normalize();
-    */
